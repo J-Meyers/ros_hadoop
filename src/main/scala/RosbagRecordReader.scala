@@ -15,10 +15,11 @@ limitations under the License.
 package io.autovia.foss
 
 import scala.collection.JavaConverters._
-
 import java.io.IOException
+import java.io.InputStream
 import java.io.FileInputStream
 import java.lang.Math.toIntExact
+import java.net.URI
 import java.nio.ByteOrder._
 import java.nio.ByteBuffer
 
@@ -27,7 +28,8 @@ import org.apache.hadoop.io._
 import org.apache.hadoop.io.compress.CompressionCodecFactory
 import org.apache.hadoop.mapreduce.{InputSplit, RecordReader, TaskAttemptContext}
 import org.apache.hadoop.mapreduce.lib.input.FileSplit
-
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
 import io.autovia.foss.proto.RosbagIdxOuterClass.RosbagIdx
 
 class RosbagBytesRecordReader extends RecordReader[LongWritable, BytesWritable] {
@@ -70,7 +72,7 @@ class RosbagBytesRecordReader extends RecordReader[LongWritable, BytesWritable] 
   override def initialize(inputSplit: InputSplit, context: TaskAttemptContext) {
     id = context.getTaskAttemptID()
     val rosChunkIdx = RosbagInputFormat.getRosChunkIdx(context)
-    idx = RosbagIdx.parseFrom(new FileInputStream(rosChunkIdx)).getArrayList.asScala.toArray
+    idx = RosbagIdxReader.getIdx(rosChunkIdx)
 
     val fileSplit = inputSplit.asInstanceOf[FileSplit]
     splitStart = idx.find(e=>e>fileSplit.getStart).get
@@ -157,7 +159,7 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
   override def initialize(inputSplit: InputSplit, context: TaskAttemptContext) {
     id = context.getTaskAttemptID()
     val rosChunkIdx = RosbagInputFormat.getRosChunkIdx(context)
-    idx = RosbagIdx.parseFrom(new FileInputStream(rosChunkIdx)).getArrayList.asScala.toArray
+    idx = RosbagIdxReader.getIdx(rosChunkIdx)
 
     val fileSplit = inputSplit.asInstanceOf[FileSplit]
     splitStart = idx.find(e=>e>fileSplit.getStart).get
@@ -248,5 +250,19 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
       return true
     }
     false
+  }
+}
+
+object RosbagIdxReader {
+  def getIdx(path: String): Array[java.lang.Long] = {
+    val idxUri = new URI(path)
+    val stream = idxUri.getScheme match {
+      case "hdfs" =>
+        val hdfs = FileSystem.get(new Configuration())
+        hdfs.open(new Path(idxUri.getPath))
+      case _ =>
+        new FileInputStream(idxUri.getPath)
+    }
+    RosbagIdx.parseFrom(stream).getArrayList.asScala.toArray
   }
 }
