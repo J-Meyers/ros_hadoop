@@ -22,7 +22,7 @@ import java.lang.Math.toIntExact
 import java.net.URI
 import java.nio.ByteOrder._
 import java.nio.ByteBuffer
-
+import org.slf4j.{Logger, LoggerFactory}
 import org.apache.hadoop.fs.FSDataInputStream
 import org.apache.hadoop.io._
 import org.apache.hadoop.io.compress.CompressionCodecFactory
@@ -31,6 +31,9 @@ import org.apache.hadoop.mapreduce.lib.input.FileSplit
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import io.autovia.foss.proto.RosbagIdxOuterClass.RosbagIdx
+
+import java.io.FileWriter
+import java.io.BufferedWriter
 
 class RosbagBytesRecordReader extends RecordReader[LongWritable, BytesWritable] {
 
@@ -131,6 +134,8 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
 
   private val queue = scala.collection.mutable.Queue[BagRecord]()
 
+  private val logger = LoggerFactory.getLogger(classOf[RosbagMapRecordReader])
+
   override def close() {
     if (fileInputStream != null) {
       fileInputStream.close()
@@ -162,8 +167,35 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
     idx = RosbagIdxReader.getIdx(rosChunkIdx)
 
     val fileSplit = inputSplit.asInstanceOf[FileSplit]
-    splitStart = idx.find(e=>e>fileSplit.getStart).get
-    splitEnd = idx.find(e=>e>fileSplit.getStart + fileSplit.getLength).getOrElse(fileSplit.getStart + fileSplit.getLength).asInstanceOf[Long]
+
+    // For debugging write the idx to a file as text
+    val idxFile = new Path("/tmp/idx.txt")
+    val fs_new = idxFile.getFileSystem(context.getConfiguration)
+    val os = fs_new.create(idxFile)
+    os.write(idx.mkString(", ").getBytes)
+    os.close()
+
+    // Append to the file splits the start and end
+    // of the split in the file
+    val filename = "/tmp/splits.txt"
+    val fw = new FileWriter(filename, true)
+    try {
+      val bw = new BufferedWriter(fw)
+      bw.write(s"${fileSplit.getStart}, ${fileSplit.getStart + fileSplit.getLength}\n")
+      bw.close()
+    }
+    finally fw.close()
+
+    val startOption = idx.find(e => e > fileSplit.getStart)
+    if (startOption.isEmpty) {
+
+      splitStart = idx.last
+      splitEnd = idx.last
+    } else
+    {
+      splitStart = startOption.get
+      splitEnd = idx.find(e=>e>fileSplit.getStart + fileSplit.getLength).getOrElse(fileSplit.getStart + fileSplit.getLength).asInstanceOf[Long]
+    }
 
     val file = fileSplit.getPath
     val conf = context.getConfiguration
@@ -176,6 +208,7 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
     fileInputStream = fs.open(file)
     fileInputStream.seek(splitStart)
     currentPosition = splitStart
+    logger.info(s"RosbagRecordReader initialized with splitStart: ${splitStart}, splitEnd: ${splitEnd} from start: ${fileSplit.getStart} and length: ${fileSplit.getLength}")
   }
 
   def serialize_header(h:Header) = {
@@ -230,6 +263,10 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
     if (recordValue == null)
       recordValue = new MapWritable()
 
+    if (splitStart == splitEnd) {
+      return false
+    }
+
     if(!queue.isEmpty) {
       dequeue_record
       return true
@@ -242,8 +279,16 @@ class RosbagMapRecordReader extends RecordReader[LongWritable, MapWritable] {
       val b = Array.ofDim[Byte](buffSize)
       fileInputStream.readFully(b)
       val p:RosbagParser = new RosbagParser(ByteBuffer.wrap(b).order(LITTLE_ENDIAN))
-      var r = p.read_record;
-      while(r.isDefined){ enqueue_record(r.get); r = p.read_record }
+      try {
+        var r = p.read_record;
+        while (r.isDefined) {
+          enqueue_record(r.get); r = p.read_record
+        }
+      } catch {
+        case e: Exception =>
+          logger.error(s"RosbagRecordReader error: ${e} with currentPosition: ${currentPosition} with start: ${splitStart} with end ${splitEnd}")
+          return false
+      }
       currentPosition = nextPosition
       if(!queue.isEmpty)
         dequeue_record
